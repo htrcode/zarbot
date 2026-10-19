@@ -24,7 +24,11 @@ CW = W - 2 * M
 BOTTOM = 70  # frame bottom (footer sits below)
 
 # ---------- fonts (bundled Noto Sans so the rupee symbol always renders) ----------
-_FONT_DIR = os.path.join(config.BASE_DIR, "fonts")
+_FONT_DIR = next(
+    (d for d in (os.path.join(config.BASE_DIR, "fonts"), config.BASE_DIR)
+     if os.path.exists(os.path.join(d, "NotoSans-Regular.ttf"))),
+    os.path.join(config.BASE_DIR, "fonts"),
+)
 try:
     pdfmetrics.registerFont(TTFont("Body", os.path.join(_FONT_DIR, "NotoSans-Regular.ttf")))
     pdfmetrics.registerFont(TTFont("Body-Bold", os.path.join(_FONT_DIR, "NotoSans-Bold.ttf")))
@@ -248,6 +252,14 @@ def _items_table(inv):
     rows = [[P("#", S_TH), P("DESCRIPTION", S_TH), P("QTY", S_TH_R), P("RATE", S_TH_R), P("AMOUNT", S_TH_R)]]
     for n, it in enumerate(inv["items"], 1):
         desc = [P(it["description"], S_ITEM)]
+        meta = " · ".join(str(x) for x in (
+            it.get("product_type"),
+            f"Plan: {it['plan']}" if it.get("plan") else "",
+            f"Node: {it['node']}" if it.get("node") else "",
+            f"Server ID: {it['server_id']}" if it.get("server_id") else "",
+        ) if x)
+        if meta:
+            desc.append(P(meta, _st("im", fontSize=8.5, leading=11.5, textColor=ACCENT)))
         desc += [P(s, S_SPEC, bulletText="•") for s in (it.get("details") or "").splitlines() if s.strip()]
         rows.append([P(n, S_SMALL), desc, P(f"{it['quantity']:g}", S_R), P(money(it["unit_price"], cur), S_R),
                      P(money(it["line_total"], cur), S_RB)])

@@ -1,10 +1,45 @@
 import datetime as dt
+import re
 from zoneinfo import ZoneInfo
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 import discord
 
 from config import CURRENCY, STAFF_ROLE_IDS, TIMEZONE
+
+# Digital products the invoice form understands (type=... on an item line).
+PRODUCT_TYPES = ("VPS", "Game Panel", "Bot", "Plugin", "Fork", "Web Hosting", "Other")
+PRODUCT_ALIASES = {
+    "vps": "VPS", "virtual server": "VPS", "vm": "VPS", "vds": "VPS",
+    "panel": "Game Panel", "game panel": "Game Panel", "pterodactyl": "Game Panel",
+    "bot": "Bot", "bot file": "Bot", "discord bot": "Bot",
+    "plugin": "Plugin", "plugins": "Plugin", "addon": "Plugin",
+    "fork": "Fork", "forks": "Fork", "forked": "Fork",
+    "hosting": "Web Hosting", "web hosting": "Web Hosting", "website": "Web Hosting",
+    "other": "Other", "custom": "Other",
+}
+
+TICKET_KINDS = ("purchase", "enquiry", "support")
+TICKET_PRIORITIES = ("low", "normal", "high", "urgent")
+
+# Sales stages, in order, with the win probability used for the forecast.
+DEAL_STAGES = ("new", "contacted", "quoted", "negotiation", "won", "lost")
+STAGE_META = {
+    "new": ("🆕 New enquiry", 0.10),
+    "contacted": ("📞 Contacted", 0.25),
+    "quoted": ("🧾 Quoted", 0.50),
+    "negotiation": ("🤝 Negotiation", 0.75),
+    "won": ("✅ Won", 1.00),
+    "lost": ("❌ Lost", 0.00),
+}
+STAGE_ALIASES = {
+    "new": "new", "open": "new", "enquiry": "new", "lead": "new",
+    "contacted": "contacted", "contact": "contacted", "called": "contacted",
+    "quoted": "quoted", "quote": "quoted", "invoiced": "quoted",
+    "negotiation": "negotiation", "negotiating": "negotiation", "followup": "negotiation",
+    "won": "won", "paid": "won", "closed-won": "won", "sold": "won",
+    "lost": "lost", "closed-lost": "lost", "cancelled": "lost",
+}
 
 
 # ---------- money (stored as integer cents everywhere) ----------
@@ -43,8 +78,40 @@ def fmt(cents: int, cur: str = CURRENCY) -> str:
     return f"{sign}{SYMBOLS.get(cur, cur + ' ')}{num}"
 
 
-def parse_items(text: str) -> list[tuple[str, float, int, str]]:
-    """Each line: item name | quantity | unit price | spec; spec; spec   (specs optional)"""
+# Recognised key=value tokens inside the 4th (details) column of an item line.
+_ITEM_KEYS = {
+    "type": "product_type", "product": "product_type", "product_type": "product_type",
+    "service_type": "product_type", "kind": "product_type",
+    "server": "service_name", "server_name": "service_name", "service": "service_name",
+    "node": "node", "location": "node",
+    "plan": "plan", "ram": "plan",
+    "id": "server_id", "server_id": "server_id", "sid": "server_id",
+    "link": "delivery_link", "panel": "delivery_link", "delivery": "delivery_link",
+    "url": "delivery_link", "access": "delivery_link",
+}
+
+
+def normalize_product(value: str) -> str:
+    """'vps' -> VPS, 'bot file' -> Bot, anything else is title-cased (max 40 chars)."""
+    raw = (value or "").strip()
+    if not raw:
+        return "Other"
+    return PRODUCT_ALIASES.get(raw.lower(), raw[:40].title())
+
+
+def normalize_stage(value: str) -> str:
+    stage = STAGE_ALIASES.get((value or "").strip().lower())
+    if not stage:
+        raise ValueError("Stage must be one of: " + ", ".join(DEAL_STAGES))
+    return stage
+
+
+def parse_items(text: str) -> list[dict]:
+    """Each line: `name | qty | unit price | type=VPS; node=Ryzen; plan=4GB; link=https://...`.
+
+    The 4th column is optional. `key=value` tokens fill the digital-service fields; any
+    other token becomes a bullet point on the invoice/PDF.
+    """
     items = []
     for n, line in enumerate(text.splitlines(), 1):
         line = line.strip()
@@ -52,9 +119,32 @@ def parse_items(text: str) -> list[tuple[str, float, int, str]]:
             continue
         parts = [p.strip() for p in line.split("|", 3)]
         if len(parts) < 3 or not parts[0]:
-            raise ValueError(f"Line {n}: use `name | quantity | unit price | spec; spec` (specs optional)")
+            raise ValueError(f"Line {n}: use `name | quantity | unit price | type=VPS; plan=4GB`")
         desc, qty_s, price_s = parts[:3]
-        specs = [s.strip()[:120] for s in (parts[3] if len(parts) == 4 else "").split(";") if s.strip()][:15]
+        product_type = ""
+        service_name = node = plan = server_id = delivery_link = ""
+        details = []
+        tokens = [s.strip() for s in (parts[3] if len(parts) == 4 else "").split(";") if s.strip()]
+        for token in tokens:
+            if "=" in token:
+                key, value = token.split("=", 1)
+                field = _ITEM_KEYS.get(key.strip().lower())
+                if field and value.strip():
+                    value = value.strip()[:300]
+                    if field == "product_type":
+                        product_type = normalize_product(value)
+                    elif field == "service_name":
+                        service_name = value
+                    elif field == "node":
+                        node = value
+                    elif field == "plan":
+                        plan = value
+                    elif field == "server_id":
+                        server_id = value
+                    elif field == "delivery_link":
+                        delivery_link = value
+                    continue
+            details.append(token[:120])
         try:
             qty = Decimal(qty_s)
         except InvalidOperation:
@@ -66,7 +156,18 @@ def parse_items(text: str) -> list[tuple[str, float, int, str]]:
         price = to_cents(price_s)
         if price < 0:
             raise ValueError(f"Line {n}: price cannot be negative")
-        items.append((desc[:200], float(qty), price, "\n".join(specs)))
+        items.append({
+            "description": desc[:200],
+            "quantity": float(qty),
+            "unit_price": price,
+            "details": "\n".join(details[:15]) or None,
+            "product_type": product_type or None,
+            "service_name": service_name or None,
+            "node": node or None,
+            "plan": plan or None,
+            "server_id": server_id or None,
+            "delivery_link": delivery_link or None,
+        })
     if not items:
         raise ValueError("Add at least one item.")
     if len(items) > 50:
@@ -108,6 +209,51 @@ def parse_date(value: str | None) -> str:
         raise ValueError("Date must look like `2026-10-17`.")
 
 
+def parse_when(value: str | None) -> str:
+    """Follow-up date: `2026-10-24`, `today`, `tomorrow`, `+3d` or `3 days`."""
+    if not value or not value.strip():
+        return today().isoformat()
+    raw = value.strip().lower()
+    if raw in ("today", "now"):
+        return today().isoformat()
+    if raw == "tomorrow":
+        return (today() + dt.timedelta(days=1)).isoformat()
+    match = re.fullmatch(r"\+?(\d{1,3})\s*(?:d|day|days)", raw)
+    if match:
+        return (today() + dt.timedelta(days=int(match.group(1)))).isoformat()
+    return parse_date(raw)
+
+
+def dmy(value: str | None) -> str:
+    """2026-10-18 -> 18-10-26 (the date style used in the finance channel)."""
+    if not value:
+        return "—"
+    try:
+        return dt.date.fromisoformat(value).strftime("%d-%m-%y")
+    except ValueError:
+        return str(value)[:20]
+
+
+def now_iso() -> str:
+    return dt.datetime.now(_tz()).replace(microsecond=0).isoformat(sep=" ")
+
+
+def days_since(value: str | None) -> int | None:
+    if not value:
+        return None
+    try:
+        stamp = dt.datetime.fromisoformat(value).date()
+    except ValueError:
+        return None
+    return (today() - stamp).days
+
+
+def safe_channel_name(text: str, limit: int = 80) -> str:
+    """Discord channel names: lowercase, dashes, no decoration."""
+    slug = re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")
+    return (slug or "ticket")[:limit].strip("-")
+
+
 def shift_month(month: str, delta: int) -> str:
     y, m = map(int, month.split("-"))
     idx = y * 12 + (m - 1) + delta
@@ -121,6 +267,17 @@ def is_staff(user) -> bool:
     return user.guild_permissions.administrator or any(
         r.id in STAFF_ROLE_IDS for r in user.roles
     )
+
+
+def is_ticket_staff(user) -> bool:
+    """Ticket staff = TICKET_STAFF_ROLE_IDS (falls back to STAFF_ROLE_IDS) or admins."""
+    from config import TICKET_STAFF_ROLE_IDS
+
+    if not isinstance(user, discord.Member):
+        return False
+    if user.guild_permissions.administrator or user.guild_permissions.manage_channels:
+        return True
+    return any(r.id in STAFF_ROLE_IDS or r.id in TICKET_STAFF_ROLE_IDS for r in user.roles)
 
 
 async def staff_interaction_check(interaction: discord.Interaction) -> bool:
